@@ -1,0 +1,7 @@
+# Extra dependency for building the standalone .exe -- not needed just to
+# run the script with `python neosky_multilog_analyzer.py`.
+#
+# Install both files before building:
+#   pip install -r requirements.txt -r requirements-desktop.txt
+
+pyinstaller==6.22.3
