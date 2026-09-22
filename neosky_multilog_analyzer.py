@@ -356,7 +356,15 @@ def analyze_single_log(path: str):
         except Exception:
             continue
 
-        t = raw.get("TimeUS") or raw.get("TimeMS")
+        # Always normalize to microseconds -- TimeUS is already microseconds;
+        # TimeMS (only used when TimeUS is absent) is milliseconds and needs
+        # scaling. Guessing the unit from magnitude (the previous approach)
+        # misclassifies short flights, since a short flight's TimeUS value
+        # can itself be numerically small.
+        t = raw.get("TimeUS")
+        if t is None:
+            t_ms = raw.get("TimeMS")
+            t = t_ms * 1000 if t_ms is not None else None
         if t:
             if t1 is None: t1 = t
             t2 = t
@@ -493,7 +501,12 @@ def analyze_single_log(path: str):
             param_change_count += 1
 
         # ── GPS ───────────────────────────────────────────────────────────
-        elif "GPS" in mtype:
+        # Exact match only (not e.g. "GPS2"/"GPS_RAW_INT2"): a secondary GPS
+        # instance can disagree with the primary receiver, and merging both
+        # into one running home-point / distance-travelled / sat-count
+        # stream would corrupt all three. analyzer.py's own single-log
+        # tool makes the same choice (GPS/GPS_RAW_INT only).
+        elif mtype in ("GPS", "GPS_RAW_INT"):
             gwk, gms = raw.get("GWk"), raw.get("GMS")
             if gwk is not None and gms is not None:
                 utc = gps_week_to_utc(gwk, gms)
@@ -601,38 +614,23 @@ def analyze_single_log(path: str):
                         landing_t = t
                         landing_lat, landing_lon = cur_lat, cur_lon
 
-        # ── CTUN (also carries desired-altitude / climb-rate targets) ───
+        # ── CTUN (desired-altitude target only) ──────────────────────────
+        # Deliberately does NOT also update balt/relalt/climb-descent-rate:
+        # CTUN's own "Alt"/"BAlt" fields are a different (EKF-blended, not
+        # raw-pressure) altitude signal than the standalone BARO message.
+        # Feeding both into one shared last-sample derivative produced
+        # spurious multi-thousand m/s "climb rate" spikes whenever a CTUN
+        # and a BARO message landed at nearly the same timestamp with a
+        # slightly different value -- confirmed against a real flight log.
+        # BARO/BAR2 alone (matching analyzer.py's precedent) stays the sole
+        # source for altitude/climb-rate/takeoff-landing detection.
         elif mtype == "CTUN":
-            a = _first(raw, "Alt", "BAlt")
-            if a is not None:
-                a = float(a)
-                ss["balt"].update(a)
-                if home_baro is None:
-                    home_baro = a
-                rel = a - home_baro
-                ss["relalt"].update(rel)
-
-                if last_alt_t is not None and t is not None:
-                    dt = (t - last_alt_t) / 1e6
-                    if dt > 0:
-                        rate = (a - last_alt_val) / dt
-                        if rate > max_climb_rate: max_climb_rate = rate
-                        if rate < max_descent_rate: max_descent_rate = rate
-                last_alt_t, last_alt_val = t, a
-
-                if armed_since is not None:
-                    if rel > TAKEOFF_ALT_THRESHOLD_M:
-                        if takeoff_t is None:
-                            takeoff_t = t
-                            takeoff_lat, takeoff_lon = cur_lat, cur_lon
-                        landing_t = t
-                        landing_lat, landing_lon = cur_lat, cur_lon
-
-                dalt = _first(raw, "DSAlt", "DAlt", "DesAlt")
-                if dalt is not None:
-                    dalt = float(dalt)
-                    ss["alt_des"].update(dalt)
-                    ss["alt_err"].update(abs(a - dalt))
+            dalt = _first(raw, "DSAlt", "DAlt", "DesAlt")
+            if dalt is not None:
+                dalt = float(dalt)
+                ss["alt_des"].update(dalt)
+                if last_alt_val is not None:
+                    ss["alt_err"].update(abs(last_alt_val - dalt))
 
         # ── NTUN (desired ground speed, when logged) ─────────────────────
         elif mtype == "NTUN":
@@ -660,7 +658,12 @@ def analyze_single_log(path: str):
             if pitch is not None and dpitch is not None:
                 ss["pitch_err"].update(abs(float(pitch) - float(dpitch)))
             if yaw is not None and dyaw is not None:
-                ss["yaw_err"].update(abs(float(yaw) - float(dyaw)))
+                # Yaw wraps 0-360 (unlike roll/pitch), so e.g. actual=358 vs
+                # desired=2 is really a 4 deg error, not 356 -- take the
+                # minor arc around the circle.
+                yaw_diff = abs(float(yaw) - float(dyaw))
+                yaw_diff = min(yaw_diff, 360.0 - yaw_diff)
+                ss["yaw_err"].update(yaw_diff)
 
         # ── RC input / link ───────────────────────────────────────────────
         elif mtype == "RCIN":
@@ -704,7 +707,7 @@ def analyze_single_log(path: str):
         return {"_error": "no timestamp data — empty or corrupt"}
 
     delta   = t2 - t1
-    dur_sec = round(delta / 1e6 if delta > 1e9 else delta / 1e3, 2)
+    dur_sec = round(delta / 1e6, 2)  # t1/t2 are always microseconds now
     armed_sec = round(armed_usec_total / 1e6, 2)
 
     def rel_or_utc(t_us, label_utc=True):
@@ -758,7 +761,7 @@ def analyze_single_log(path: str):
         "GPS Accuracy Vertical": ss["vacc"].get("mean"),
         "GPS Ground Speed Avg": ss["gspeed"].get("mean"),
         "GPS Ground Speed Max": ss["gspeed"].get("max"),
-        "GPS Course": last_course if last_course is not None else "N/A",
+        "GPS Course": round(last_course, 2) if last_course is not None else "N/A",
         "GPS Glitch Count": gps_glitch_count,
         "GPS Glitch Duration (sec)": round(gps_glitch_total, 2),
         "Distance Travelled (m)": round(distance_travelled, 1),
@@ -824,7 +827,7 @@ def analyze_single_log(path: str):
         "Pitch Tracking Error": ss["pitch_err"].get("max"),
         "Yaw Tracking Error": ss["yaw_err"].get("max"),
         "Altitude Tracking Error": ss["alt_err"].get("max"),
-        "Actual Climb Rate": max_climb_rate,
+        "Actual Climb Rate": round(max_climb_rate, 2),
         "Desired Climb Rate": NA,
         "Desired Ground Speed": ss["gspeed_des"].get("mean"),
         "Actual Ground Speed": ss["gspeed"].get("mean"),
