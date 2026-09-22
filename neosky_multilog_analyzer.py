@@ -1,5 +1,5 @@
 """
-Neosky Multilog Analyzer — Merged Desktop Edition v4.0
+Neosky Multilog Analyzer — Merged Desktop Edition v4.1
 ========================================================
 Merges two prior tools into one standalone desktop app, plus a much wider
 data extraction pass:
@@ -32,7 +32,9 @@ for those, this tool fills them with the literal string
 what was asked for, without silently making anything up.
 
 Handles 30 GB+ of ArduPilot .bin logs with:
-  • Select individual files, OR select a root folder and recurse into it
+  • Queue any mix of individual files and multiple folders before starting --
+    "Add Folder" can be clicked repeatedly to queue several folders (each
+    scanned recursively) in the same run, alongside individually-added files
   • Folder-name-prefixed renaming (mission/folder context preserved in the
     flat report, done once per file, safe to re-run)
   • Multi-process parallel parsing  (N-1 CPU cores)
@@ -974,12 +976,14 @@ class NeoskyMultilogAnalyzer:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Neosky Multilog Analyzer  v4.0")
+        self.root.title("Neosky Multilog Analyzer  v4.1")
         self.root.geometry("760x640")
         self.root.configure(bg="#f0f3f4")
         self.gui_queue: queue.Queue = queue.Queue()
         self._active   = False
         self._pool     = None          # reference so Stop can terminate it
+        self._pending_folders: list = []   # folders queued via "Add Folder" (multiple allowed)
+        self._pending_files: list = []     # individually-picked files queued via "Add Files"
         self._build_ui()
         self.root.after(150, self._drain_queue)
 
@@ -993,7 +997,7 @@ class NeoskyMultilogAnalyzer:
         tk.Label(hdr, text="NEOSKY MULTILOG ANALYZER",
                  fg="#ecf0f1", bg="#1a252f",
                  font=("Segoe UI", 15, "bold")).pack(side="left", padx=20, pady=15)
-        tk.Label(hdr, text=f"v4.0  —  {self.WORKERS} parallel workers",
+        tk.Label(hdr, text=f"v4.1  —  {self.WORKERS} parallel workers",
                  fg="#7f8c8d", bg="#1a252f",
                  font=("Segoe UI", 9)).pack(side="right", padx=18, pady=20)
 
@@ -1029,28 +1033,63 @@ class NeoskyMultilogAnalyzer:
                  bg="#f0f3f4", fg="#5d6d7e", font=("Segoe UI", 8, "italic"),
                  wraplength=700, justify="left").pack(anchor="w", pady=(0, 10))
 
+        # ── selection queue (multiple folders and/or files can be added) ──
+        tk.Label(body,
+                 text="Add one or more folders and/or files, then start. "
+                      "Each \"Add Folder\" click queues another folder (scanned recursively) "
+                      "without clearing what's already queued.",
+                 bg="#f0f3f4", fg="#5d6d7e", font=("Segoe UI", 8, "italic"),
+                 wraplength=700, justify="left").pack(anchor="w", pady=(0, 4))
+
+        add_row = tk.Frame(body, bg="#f0f3f4")
+        add_row.pack()
+        self.btn_add_files = tk.Button(
+            add_row, text="+  ADD FILES (.bin)",
+            command=self._add_files,
+            height=2, width=20,
+            bg="#2980b9", fg="white",
+            font=("Segoe UI", 10, "bold"),
+            relief="flat", cursor="hand2",
+        )
+        self.btn_add_files.pack(side="left", padx=4)
+
+        self.btn_add_folder = tk.Button(
+            add_row, text="📁  ADD FOLDER (recursive)",
+            command=self._add_folder,
+            height=2, width=24,
+            bg="#2980b9", fg="white",
+            font=("Segoe UI", 10, "bold"),
+            relief="flat", cursor="hand2",
+        )
+        self.btn_add_folder.pack(side="left", padx=4)
+
+        self.btn_clear = tk.Button(
+            add_row, text="✕  CLEAR",
+            command=self._clear_selection,
+            height=2, width=10,
+            bg="#7f8c8d", fg="white",
+            font=("Segoe UI", 10, "bold"),
+            relief="flat", cursor="hand2",
+        )
+        self.btn_clear.pack(side="left", padx=4)
+
+        self.lbl_selection = tk.Label(body, text="Nothing queued yet.",
+                                      bg="#f0f3f4", fg="#2c3e50",
+                                      font=("Segoe UI", 9, "bold"))
+        self.lbl_selection.pack(pady=(6, 8))
+
         # ── action buttons ──
         btn_row = tk.Frame(body, bg="#f0f3f4")
         btn_row.pack()
-        self.btn_files = tk.Button(
-            btn_row, text="▶   SELECT FILES (.bin)",
-            command=self._pick_files,
+        self.btn_start = tk.Button(
+            btn_row, text="▶   START ANALYSIS",
+            command=self._start_analysis,
             height=2, width=22,
-            bg="#2980b9", fg="white",
+            bg="#27ae60", fg="white",
             font=("Segoe UI", 10, "bold"),
             relief="flat", cursor="hand2",
         )
-        self.btn_files.pack(side="left", padx=4)
-
-        self.btn_folder = tk.Button(
-            btn_row, text="📁  SELECT FOLDER (recursive)",
-            command=self._pick_source_folder,
-            height=2, width=26,
-            bg="#2980b9", fg="white",
-            font=("Segoe UI", 10, "bold"),
-            relief="flat", cursor="hand2",
-        )
-        self.btn_folder.pack(side="left", padx=4)
+        self.btn_start.pack(side="left", padx=4)
 
         self.btn_stop = tk.Button(
             btn_row, text="⏹  STOP",
@@ -1064,7 +1103,7 @@ class NeoskyMultilogAnalyzer:
         self.btn_stop.pack(side="left", padx=4)
 
         # ── progress label + bar ──
-        self.lbl_progress = tk.Label(body, text="Ready — select .bin files or a folder to begin.",
+        self.lbl_progress = tk.Label(body, text="Ready — add folders/files above, then start.",
                                      bg="#f0f3f4", font=("Segoe UI", 10))
         self.lbl_progress.pack(pady=(14, 2))
 
@@ -1115,51 +1154,100 @@ class NeoskyMultilogAnalyzer:
 
     def _set_running(self, running: bool):
         if running:
-            self.btn_files.config(state="disabled", bg="#7f8c8d", cursor="arrow")
-            self.btn_folder.config(state="disabled", bg="#7f8c8d", cursor="arrow")
+            self.btn_add_files.config(state="disabled", bg="#7f8c8d", cursor="arrow")
+            self.btn_add_folder.config(state="disabled", bg="#7f8c8d", cursor="arrow")
+            self.btn_clear.config(state="disabled", bg="#7f8c8d", cursor="arrow")
+            self.btn_start.config(state="disabled", bg="#7f8c8d", cursor="arrow")
             self.btn_stop.config(state="normal",   bg="#c0392b", cursor="hand2")
         else:
-            self.btn_files.config(state="normal",   bg="#2980b9", cursor="hand2")
-            self.btn_folder.config(state="normal",   bg="#2980b9", cursor="hand2")
+            self.btn_add_files.config(state="normal",   bg="#2980b9", cursor="hand2")
+            self.btn_add_folder.config(state="normal",   bg="#2980b9", cursor="hand2")
+            self.btn_clear.config(state="normal",   bg="#7f8c8d", cursor="hand2")
+            self.btn_start.config(state="normal",   bg="#27ae60", cursor="hand2")
             self.btn_stop.config(state="disabled", bg="#7f8c8d", cursor="arrow")
 
-    # ── selection entry points ──────────────────────────────────────────────
+    # ── selection queue ──────────────────────────────────────────────────────
 
-    def _pick_files(self):
+    def _update_selection_label(self):
+        nf, nfl = len(self._pending_files), len(self._pending_folders)
+        if nf == 0 and nfl == 0:
+            self.lbl_selection.config(text="Nothing queued yet.")
+        else:
+            self.lbl_selection.config(
+                text=f"Queued: {nfl} folder(s) (scanned recursively) + {nf} individual file(s)")
+
+    def _add_files(self):
         if not MAVUTIL_OK:
             messagebox.showerror("Missing dependency",
                                  "pymavlink is not installed.\n\n"
                                  "Run:  pip install pymavlink")
             return
         files = filedialog.askopenfilenames(
-            title="Select ArduPilot .bin log files",
+            title="Add ArduPilot .bin log files (you can add more afterwards)",
             filetypes=[("ArduPilot Logs", "*.bin"), ("All files", "*.*")],
         )
         if not files:
             return
-        self._begin(list(files))
+        added = 0
+        for f in files:
+            if f not in self._pending_files:
+                self._pending_files.append(f)
+                added += 1
+        self._log(f"+ {added} file(s) added to the queue.")
+        self._update_selection_label()
 
-    def _pick_source_folder(self):
+    def _add_folder(self):
         if not MAVUTIL_OK:
             messagebox.showerror("Missing dependency",
                                  "pymavlink is not installed.\n\n"
                                  "Run:  pip install pymavlink")
             return
-        folder = filedialog.askdirectory(title="Select root folder of logs (scanned recursively)")
+        folder = filedialog.askdirectory(
+            title="Add a folder of logs (scanned recursively) — click Add Folder again for more")
         if not folder:
             return
-
-        files = []
-        for dirpath, _dirnames, filenames in os.walk(folder):
-            for fn in filenames:
-                if fn.lower().endswith(self.LOG_EXT):
-                    files.append(os.path.join(dirpath, fn))
-
-        if not files:
-            messagebox.showwarning("No logs found",
-                                   f"No {self.LOG_EXT} files found under:\n{folder}")
+        if folder in self._pending_folders:
+            self._log(f"(already queued) {folder}")
             return
-        self._begin(files)
+        self._pending_folders.append(folder)
+        self._log(f"+ folder queued: {folder}")
+        self._update_selection_label()
+
+    def _clear_selection(self):
+        self._pending_folders.clear()
+        self._pending_files.clear()
+        self._update_selection_label()
+        self._log_clear()
+        self._log("Selection cleared.")
+
+    def _start_analysis(self):
+        if not self._pending_folders and not self._pending_files:
+            messagebox.showwarning("Nothing selected",
+                                   "Add at least one folder or file first.")
+            return
+
+        files = list(self._pending_files)
+        for folder in self._pending_folders:
+            for dirpath, _dirnames, filenames in os.walk(folder):
+                for fn in filenames:
+                    if fn.lower().endswith(self.LOG_EXT):
+                        files.append(os.path.join(dirpath, fn))
+
+        # De-dupe (a file could be reachable both directly and via a queued
+        # folder) while preserving the order picked.
+        seen = set()
+        unique_files = []
+        for f in files:
+            key = os.path.realpath(f)
+            if key not in seen:
+                seen.add(key)
+                unique_files.append(f)
+
+        if not unique_files:
+            messagebox.showwarning("No logs found",
+                                   f"No {self.LOG_EXT} files found in the queued folders/files.")
+            return
+        self._begin(unique_files)
 
     def _begin(self, files: list):
         out_dir = self._out_var.get().strip() or str(Path.home())
